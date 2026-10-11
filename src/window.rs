@@ -152,6 +152,8 @@ const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+const TASKBAR_WATCH_HEARTBEAT_SECS: u64 = 60;
+const TIMER_DIAGNOSTIC_HEARTBEAT: usize = 5;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -200,7 +202,8 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
 /// taskbar - and exiting this one is the robust recovery. The child is flagged
 /// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
 /// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
+fn relaunch_self(reason: &str) {
+    diagnose::log(format!("relaunch requested reason={reason}"));
     // Back off if we are relaunching very soon after the relaunch that spawned
     // us: that signals the shell is crash-looping, not a one-off restart.
     let now = now_unix_secs();
@@ -216,7 +219,10 @@ fn relaunch_self() {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
+            diagnose::log(format!(
+                "watchdog: unable to resolve current executable kind={:?}",
+                error.kind()
+            ));
             return;
         }
     };
@@ -228,12 +234,18 @@ fn relaunch_self() {
         .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
         .spawn()
     {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+        Ok(child) => {
+            diagnose::log(format!(
+                "watchdog: child process spawned pid={}; exiting old process",
+                child.id()
+            ));
             std::process::exit(0);
         }
         Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
+            diagnose::log(format!(
+                "watchdog: unable to spawn relaunched instance kind={:?}",
+                error.kind()
+            ));
         }
     }
 }
@@ -245,24 +257,45 @@ fn relaunch_self() {
 /// dedicated thread (independent of the dead message loop) polls the taskbar
 /// handle and, when it changes, relaunches the widget as a fresh process.
 fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
-        };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
-        };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
-            relaunch_self();
+    diagnose::log("taskbar watchdog thread starting");
+    std::thread::spawn(move || {
+        let mut last_heartbeat = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+            let (window_hwnd, stored) = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| (s.hwnd.to_hwnd(), s.taskbar_hwnd))
+                    .unwrap_or((HWND::default(), None))
+            };
+            if stored.is_none() && !diagnose::is_enabled() {
+                continue;
+            }
+            let taskbars = native_interop::find_taskbars();
+            if last_heartbeat.elapsed() >= Duration::from_secs(TASKBAR_WATCH_HEARTBEAT_SECS) {
+                let current: Vec<_> = taskbars.iter().map(|taskbar| taskbar.hwnd.0).collect();
+                let window_valid = unsafe { IsWindow(window_hwnd).as_bool() };
+                let stored_taskbar_valid = stored.map(|hwnd| unsafe { IsWindow(hwnd).as_bool() });
+                diagnose::log(format!(
+                    "watchdog heartbeat hwnd={:?} hwnd_valid={window_valid} stored_taskbar={:?} stored_taskbar_valid={stored_taskbar_valid:?} current_taskbars={current:?}",
+                    window_hwnd.0,
+                    stored.map(|hwnd| hwnd.0)
+                ));
+                last_heartbeat = Instant::now();
+            }
+            // Only relevant once we have embedded into a taskbar at least once.
+            let Some(old) = stored else {
+                continue;
+            };
+            if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+                let new = taskbars[0].hwnd;
+                diagnose::log(format!(
+                    "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                    old.0, new.0
+                ));
+                relaunch_self("taskbar_handle_changed");
+            }
         }
     });
 }
@@ -403,11 +436,7 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
     if migrated || claude_auto_disabled {
         save_settings(&settings);
         if migrated {
-            diagnose::log(format!(
-                "migrated settings from {} to {}",
-                legacy_path.display(),
-                current_path.display()
-            ));
+            diagnose::log("migrated settings from legacy location");
         }
         if claude_auto_disabled {
             diagnose::log(
@@ -800,6 +829,11 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     }
 
     native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+    let actual_parent = unsafe { GetParent(hwnd) };
+    diagnose::log(format!(
+        "taskbar embedding parent expected={:?} actual={:?}",
+        taskbar.hwnd.0, actual_parent
+    ));
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -1197,13 +1231,19 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
         app_state.language.strings()
     };
 
+    diagnose::log("self-update worker starting");
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
         match updater::begin_self_update(&release) {
             Ok(()) => unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                let posted = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                diagnose::log(format!(
+                    "self-update helper succeeded; WM_CLOSE posted={}",
+                    posted.is_ok()
+                ));
             },
             Err(error) => {
+                diagnose::log("self-update helper failed");
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
@@ -1229,9 +1269,14 @@ fn begin_winget_update(hwnd: HWND) {
 
     match updater::begin_winget_update() {
         Ok(()) => unsafe {
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            let posted = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            diagnose::log(format!(
+                "winget update helper succeeded; WM_CLOSE posted={}",
+                posted.is_ok()
+            ));
         },
         Err(error) => {
+            diagnose::log("winget update helper failed");
             let message = format!("{}.\n\n{}", strings.update_failed, error);
             show_error_message(hwnd, strings.updates, &message);
         }
@@ -1562,12 +1607,14 @@ pub fn run() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CURRENT_DPI.store(GetDpiForSystem(), Ordering::Relaxed);
     }
-    diagnose::log("window::run started");
-
     // Single-instance guard: silently exit if another instance is running.
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
+    diagnose::log(format!(
+        "window::run started pid={} relaunch={is_relaunch}",
+        std::process::id()
+    ));
     let mutex_name = native_interop::wide_str("Global\\CodexUsage");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
@@ -1576,7 +1623,12 @@ pub fn run() {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
                     if is_relaunch {
                         diagnose::log("relaunch: waiting for previous instance to exit");
+                        let wait_started = Instant::now();
                         let wait_result = WaitForSingleObject(h, 10_000);
+                        diagnose::log(format!(
+                            "relaunch: previous-instance wait result={wait_result:?} elapsed_ms={}",
+                            wait_started.elapsed().as_millis()
+                        ));
                         if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
                             diagnose::log(format!(
                                 "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
@@ -1587,6 +1639,8 @@ pub fn run() {
                         diagnose::log("startup aborted: another instance is already running");
                         return;
                     }
+                } else {
+                    diagnose::log("single-instance mutex acquired");
                 }
                 h
             }
@@ -1756,7 +1810,10 @@ pub fn run() {
         if settings.widget_visible {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
-        diagnose::log("window shown");
+        diagnose::log(format!(
+            "window initialization complete visible={} embedded={embedded}",
+            settings.widget_visible
+        ));
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
@@ -1769,7 +1826,18 @@ pub fn run() {
                 .map(|s| s.poll_interval_ms)
                 .unwrap_or(POLL_15_MIN)
         };
-        SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        let poll_timer = SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        diagnose::log(format!(
+            "poll timer installed={} interval_ms={initial_poll_ms}",
+            poll_timer != 0
+        ));
+        if diagnose::is_enabled() {
+            let timer = SetTimer(hwnd, TIMER_DIAGNOSTIC_HEARTBEAT, 60_000, None);
+            diagnose::log(format!(
+                "diagnostic UI heartbeat timer installed={}",
+                timer != 0
+            ));
+        }
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -1802,10 +1870,21 @@ pub fn run() {
 
         // Message loop
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+        let mut get_message_error_logged = false;
+        loop {
+            let result = GetMessageW(&mut msg, HWND::default(), 0, 0);
+            if result.0 == 0 {
+                diagnose::log(format!("WM_QUIT received exit_code={}", msg.wParam.0));
+                break;
+            }
+            if result.0 == -1 && !get_message_error_logged {
+                diagnose::log(format!("GetMessageW failed error={:?}", GetLastError()));
+                get_message_error_logged = true;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        diagnose::log("window message loop exited");
     }
 }
 
@@ -2237,8 +2316,16 @@ fn do_poll(send_hwnd: SendHwnd) {
             .unwrap_or((true, false, false))
     };
 
+    let poll_started = Instant::now();
+    diagnose::log(format!(
+        "usage poll started providers=claude:{show_claude_code},codex:{show_codex},antigravity:{show_antigravity}"
+    ));
     match poller::poll(show_claude_code, show_codex, show_antigravity) {
         Ok(data) => {
+            diagnose::log(format!(
+                "usage poll completed result=success elapsed_ms={}",
+                poll_started.elapsed().as_millis()
+            ));
             let mut state = lock_state();
             let mut quota_alerts = Vec::new();
             if let Some(s) = state.as_mut() {
@@ -2292,10 +2379,7 @@ fn do_poll(send_hwnd: SendHwnd) {
 
             for alert in &quota_alerts {
                 tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
-                diagnose::log(format!(
-                    "low quota alert emitted title={} message={}",
-                    alert.title, alert.message
-                ));
+                diagnose::log("low quota alert emitted");
             }
             if !quota_alerts.is_empty() {
                 save_state_settings();
@@ -2306,6 +2390,11 @@ fn do_poll(send_hwnd: SendHwnd) {
             }
         }
         Err(e) => {
+            diagnose::log(format!(
+                "usage poll completed result=error category={} elapsed_ms={}",
+                e.category(),
+                poll_started.elapsed().as_millis()
+            ));
             let auth_watch = match e {
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired
                     if show_antigravity && !show_claude_code && !show_codex =>
@@ -2700,6 +2789,16 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_CLOSE => diagnose::log(format!("WM_CLOSE received hwnd={:?}", hwnd.0)),
+        WM_QUERYENDSESSION => diagnose::log("WM_QUERYENDSESSION received"),
+        WM_ENDSESSION => diagnose::log(format!("WM_ENDSESSION received ending={}", wparam.0 != 0)),
+        WM_POWERBROADCAST => {
+            diagnose::log(format!("WM_POWERBROADCAST received event={}", wparam.0))
+        }
+        _ => {}
+    }
+
+    match msg {
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
@@ -2798,6 +2897,9 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
+                }
+                TIMER_DIAGNOSTIC_HEARTBEAT => {
+                    diagnose::log(format!("UI heartbeat hwnd={:?}", hwnd.0));
                 }
                 _ => {}
             }
@@ -3049,6 +3151,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 2 => {
+                    diagnose::log("exit menu command selected; posting WM_QUIT");
                     let hook = {
                         let state = lock_state();
                         state.as_ref().and_then(|s| s.win_event_hook)
@@ -3239,6 +3342,15 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let taskbar_hwnd = {
+                let state = lock_state();
+                state.as_ref().and_then(|s| s.taskbar_hwnd)
+            };
+            diagnose::log(format!(
+                "WM_DESTROY received hwnd={:?} stored_taskbar={:?}; posting WM_QUIT",
+                hwnd.0,
+                taskbar_hwnd.map(|taskbar| taskbar.0)
+            ));
             let hook = {
                 let state = lock_state();
                 state.as_ref().and_then(|s| s.win_event_hook)

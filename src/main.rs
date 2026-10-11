@@ -15,15 +15,13 @@ fn main() {
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
-            Ok(path) => {
-                diagnose::log(format!("startup args={args:?} log_path={}", path.display()));
+            Ok(()) => {
+                diagnose::install_panic_hook();
                 diagnose::log(format!(
-                    "version={} install_channel={:?} executable={}",
+                    "startup diagnostic_build=local-instrumentation version={} install_channel={:?} pid={}",
                     env!("CARGO_PKG_VERSION"),
                     updater::current_install_channel(),
-                    std::env::current_exe()
-                        .map(|value| value.display().to_string())
-                        .unwrap_or_else(|error| format!("unavailable:{error}"))
+                    std::process::id()
                 ));
             }
             Err(error) => {
@@ -44,4 +42,5 @@ fn main() {
         diagnose::log("entering window::run");
     }
     window::run();
+    diagnose::log("window::run returned; main is exiting");
 }
