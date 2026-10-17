@@ -120,8 +120,20 @@ pub fn launch(
         if let Err(error) = std::thread::Builder::new()
             .name(format!("quota-provider-{}", job.id))
             .spawn(move || {
+                let started = Instant::now();
                 crate::diagnose::log(format!("provider query started id={}", worker_job.id));
-                worker_complete(&worker_job, worker_poll(&worker_job));
+                let attempt = worker_poll(&worker_job);
+                let outcome = match attempt.result.as_ref() {
+                    Some(Ok(_)) => "success",
+                    Some(Err(error)) => error.category(),
+                    None => "credentials_unchanged",
+                };
+                crate::diagnose::log(format!(
+                    "provider query completed id={} result={outcome} elapsed_ms={}",
+                    worker_job.id,
+                    started.elapsed().as_millis()
+                ));
+                worker_complete(&worker_job, attempt);
             })
         {
             crate::diagnose::log_error("unable to start provider query", error);

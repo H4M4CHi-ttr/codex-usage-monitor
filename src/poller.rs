@@ -271,12 +271,8 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
 
         match read_credentials_from_source(&source) {
             Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
-            )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
-            )),
+            Some(_) => diagnose::log("refreshed credentials are still expired"),
+            None => diagnose::log("credentials unavailable after refresh attempt"),
         }
 
         match read_next_credentials_after(&source) {
@@ -298,9 +294,7 @@ fn cli_refresh_token(source: &CredentialSource) {
 fn cli_refresh_windows_token() {
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
-    diagnose::log(format!(
-        "attempting Windows Claude token refresh via {claude_path}"
-    ));
+    diagnose::log("attempting Windows Claude token refresh");
 
     let args: &[&str] = &["-p", "."];
 
@@ -346,9 +340,7 @@ fn cli_refresh_windows_token() {
 }
 
 fn cli_refresh_wsl_token(distro: &str) {
-    diagnose::log(format!(
-        "attempting WSL Claude token refresh in distro {distro}"
-    ));
+    diagnose::log("attempting WSL Claude token refresh");
     let mut cmd = Command::new("wsl.exe");
     cmd.arg("-d")
         .arg(distro)
@@ -378,9 +370,7 @@ fn cli_refresh_codex_token() {
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
     let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
+    diagnose::log("attempting Windows Codex token refresh");
 
     let args: &[&str] = &["exec", "."];
 
@@ -1249,13 +1239,7 @@ fn read_windows_credentials() -> Option<Credentials> {
         Ok(content) => content,
         Err(error) => {
             if diagnose::is_enabled() {
-                diagnose::log_error(
-                    &format!(
-                        "unable to read Windows credentials at {}",
-                        cred_path.display()
-                    ),
-                    error,
-                );
+                diagnose::log_error("unable to read Windows credentials", error);
             }
             return None;
         }
@@ -1286,13 +1270,7 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
     let content = match std::fs::read_to_string(&auth_path) {
         Ok(content) => content,
         Err(error) => {
-            diagnose::log_error(
-                &format!(
-                    "unable to read Codex credentials at {}",
-                    auth_path.display()
-                ),
-                error,
-            );
+            diagnose::log_error("unable to read Codex credentials", error);
             return None;
         }
     };
@@ -1327,9 +1305,7 @@ fn read_windows_generic_credential(target: &str) -> Option<String> {
     };
 
     if ok == 0 || credential.is_null() {
-        diagnose::log(format!(
-            "unable to read Windows generic credential target {target}"
-        ));
+        diagnose::log("unable to read Windows generic credential");
         return None;
     }
 
@@ -1366,7 +1342,7 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
 
     if !output.status.success() {
         diagnose::log(format!(
-            "WSL credentials probe failed for distro {distro} with status {}",
+            "WSL credentials probe failed with status {}",
             output.status
         ));
         return None;

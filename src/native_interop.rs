@@ -174,6 +174,7 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
 
 /// Embed our window as a child of the taskbar
 pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+    // SAFETY: the UI thread owns the widget and holds no application locks.
     unsafe {
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
@@ -185,15 +186,82 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            ex_style
+                | WS_EX_LAYERED.0 as i32
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32,
         );
 
         // Change from popup to child
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+        if GetParent(hwnd).ok() != Some(taskbar_hwnd) {
+            let _ = SetParent(hwnd, taskbar_hwnd);
+        }
+    }
+}
+/// Check the widget itself, not IsWindowVisible, which also follows an auto-hidden parent.
+pub fn taskbar_widget_needs_restore(hwnd: HWND, taskbar: &TaskbarWindow, visible: bool) -> bool {
+    // SAFETY: these queries accept HWND values without dereferencing application memory;
+    // invalid or concurrently destroyed windows are treated as needing recovery.
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if GetParent(hwnd).ok() != Some(taskbar.hwnd) || style & WS_CHILD.0 == 0 {
+            return true;
+        }
+        if (style & WS_VISIBLE.0 != 0) != visible {
+            return true;
+        }
+        if !visible {
+            return false;
+        }
+        if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 == 0 {
+            return true;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client).is_err()
+            || client.right <= client.left
+            || client.bottom <= client.top
+        {
+            return true;
+        }
+        let Some(rect) = get_window_rect_safe(hwnd) else {
+            return true;
+        };
+        // Use the actual parent's bounds, not its logical appbar position:
+        // an auto-hidden taskbar can be moved just outside the screen.
+        let Some(parent_rect) = get_window_rect_safe(taskbar.hwnd) else {
+            return true;
+        };
+        rect.right <= parent_rect.left
+            || rect.left >= parent_rect.right
+            || rect.bottom <= parent_rect.top
+            || rect.top >= parent_rect.bottom
+    }
+}
 
-        let _ = SetParent(hwnd, taskbar_hwnd);
+/// Restore the widget's own visibility and child Z order, never its parent's visibility.
+pub fn set_widget_visibility(hwnd: HWND, visible: bool) -> windows::core::Result<()> {
+    // SAFETY: no pointers are passed and the caller invokes this on its widget's UI thread,
+    // without holding application locks that synchronous window messages could re-enter.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOACTIVATE
+                | if visible {
+                    SWP_SHOWWINDOW
+                } else {
+                    SWP_HIDEWINDOW
+                },
+        )
     }
 }
 
@@ -264,17 +332,25 @@ mod attachment_tests {
                 AlphaFormat: AC_SRC_ALPHA as u8,
                 ..Default::default()
             };
-            let rendered = UpdateLayeredWindow(
-                child,
-                None,
-                Some(&point),
-                Some(&size),
-                dc,
-                Some(&point),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            let mut rendered = Ok(());
+            for _ in 0..3 {
+                SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
+                embed_in_taskbar(child, parent);
+                rendered = UpdateLayeredWindow(
+                    child,
+                    None,
+                    Some(&point),
+                    Some(&size),
+                    dc,
+                    Some(&point),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+                if rendered.is_err() {
+                    break;
+                }
+            }
             let _ = SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);

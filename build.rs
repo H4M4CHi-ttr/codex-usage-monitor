@@ -6,6 +6,18 @@ fn main() {
     // Embed the icon and richer PE version metadata into the executable.
     let mut res = WindowsResource::new();
     let numeric_version = pack_version(version);
+    // Windows requires a Windows 8+ compatibility declaration for layered children.
+    // Without it, resetting WS_EX_LAYERED on an already embedded widget is ignored.
+    res.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+    <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+        <application>
+            <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+            <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+        </application>
+    </compatibility>
+</assembly>"#,
+    );
 
     res.set_icon("src/icons/icon.ico")
         .set("FileVersion", version)

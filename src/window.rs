@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,14 +51,64 @@ impl SendHwnd {
     }
 }
 
+/// Called only on the UI thread, without holding STATE during synchronous Win32 calls.
+fn restore_widget(hwnd: HWND) -> bool {
+    if TASKBAR_LIFECYCLE.recovery_suppressed()
+        || TASKBAR_LIFECYCLE.widget_destroyed.load(Ordering::SeqCst)
+    {
+        return false;
+    }
+    let visible = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        if s.dragging || s.hwnd.to_hwnd() != hwnd {
+            return false;
+        }
+        s.widget_visible
+    };
+    // Force reattachment even if HWNDs match: resume may have lost the layer surface,
+    // child visibility, parent relationship or tray hook without destroying either HWND.
+    if !refresh_taskbar_selection(hwnd) || !position_at_taskbar() {
+        return false;
+    }
+    let rendered = render_layered();
+    let shown = native_interop::set_widget_visibility(hwnd, visible);
+    if let Err(error) = &shown {
+        diagnose::log_error("unable to restore widget visibility", error);
+    }
+    diagnose::log(format!(
+        "widget restored hwnd={:?} visible={visible} rendered={rendered} visibility_applied={}",
+        hwnd.0,
+        shown.is_ok()
+    ));
+    rendered && shown.is_ok()
+}
+
+fn request_widget_restore(hwnd: HWND) {
+    // SAFETY: only scalar values are posted; no notification pointers outlive their message.
+    let posted = unsafe { PostMessageW(hwnd, WM_APP_TASKBAR_REFRESH, WPARAM(0), LPARAM(0)) };
+    if let Err(error) = posted {
+        diagnose::log_error("unable to request widget restoration", error);
+    }
+}
+fn taskbar_restore_retry_needed(remaining: &mut u8, embedded: bool) -> bool {
+    *remaining = remaining.saturating_sub(1);
+    // Only initial attachment waits indefinitely; surface restoration is bounded.
+    !embedded || *remaining != 0
+}
+
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
+    observer_hwnd: SendHwnd,
     taskbar_hwnd: Option<HWND>,
     tray_notify_hwnd: Option<HWND>,
     win_event_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
     embedded: bool,
+    taskbar_restore_retries: u8,
     language_override: Option<LanguageId>,
     language: LanguageId,
     appearance: Appearance,
@@ -169,13 +219,194 @@ const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_TASKBAR_REFRESH: u32 = WM_APP + 5;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+const TASKBAR_WATCH_HEARTBEAT_SECS: u64 = 60;
+const TIMER_DIAGNOSTIC_HEARTBEAT: usize = 7;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Separate permanent exit requests from a session-end query that can be canceled.
+struct TaskbarLifecycle {
+    exit_requested: AtomicBool,
+    session_ending: AtomicBool,
+    widget_destroyed: AtomicBool,
+    taskbar_created_message: AtomicU32,
+}
+
+impl TaskbarLifecycle {
+    const fn new() -> Self {
+        Self {
+            exit_requested: AtomicBool::new(false),
+            session_ending: AtomicBool::new(false),
+            widget_destroyed: AtomicBool::new(false),
+            taskbar_created_message: AtomicU32::new(0),
+        }
+    }
+
+    fn request_exit(&self) {
+        self.exit_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn query_end_session(&self) {
+        self.session_ending.store(true, Ordering::SeqCst);
+    }
+
+    fn end_session(&self, ending: bool) {
+        if ending {
+            self.request_exit();
+        }
+        self.session_ending.store(ending, Ordering::SeqCst);
+    }
+
+    fn recovery_suppressed(&self) -> bool {
+        self.exit_requested.load(Ordering::SeqCst) || self.session_ending.load(Ordering::SeqCst)
+    }
+
+    fn record_widget_destroyed(&self, initialized: bool) -> bool {
+        // Keep a latch: Windows can reuse the numeric HWND before the next watchdog tick.
+        self.widget_destroyed.store(true, Ordering::SeqCst);
+        self.exit_requested.load(Ordering::SeqCst) || !initialized
+    }
+
+    fn relaunch_reason(
+        &self,
+        widget_valid: bool,
+        stored_taskbar: bool,
+        stored_taskbar_present: bool,
+        taskbars_available: bool,
+    ) -> Option<&'static str> {
+        if self.recovery_suppressed() || !taskbars_available {
+            None
+        } else if self.widget_destroyed.load(Ordering::SeqCst) || !widget_valid {
+            Some("widget_destroyed")
+        } else if stored_taskbar && !stored_taskbar_present {
+            Some("taskbar_handle_changed")
+        } else {
+            None
+        }
+    }
+}
+
+static TASKBAR_LIFECYCLE: TaskbarLifecycle = TaskbarLifecycle::new();
+
+/// The caller must keep `lifecycle` alive until this UI-thread window is destroyed.
+unsafe fn create_taskbar_observer(lifecycle: &TaskbarLifecycle) -> windows::core::Result<HWND> {
+    let class_name = native_interop::wide_str("CodexUsageTaskbarObserver");
+    let instance = GetModuleHandleW(PCWSTR::null())?;
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(taskbar_observer_proc),
+        hInstance: HINSTANCE(instance.0),
+        lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+        ..Default::default()
+    };
+    if RegisterClassW(&class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
+        return Err(windows::core::Error::from_win32());
+    }
+    let message_name = native_interop::wide_str("TaskbarCreated");
+    let message = RegisterWindowMessageW(PCWSTR::from_raw(message_name.as_ptr()));
+    if message == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+    lifecycle
+        .taskbar_created_message
+        .store(message, Ordering::SeqCst);
+    // Not HWND_MESSAGE: message-only windows do not receive shell/session broadcasts.
+    CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        PCWSTR::from_raw(class_name.as_ptr()),
+        PCWSTR::null(),
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        instance,
+        Some(lifecycle as *const TaskbarLifecycle as *const std::ffi::c_void),
+    )
+}
+
+unsafe extern "system" fn taskbar_observer_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let create = &*(lparam.0 as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    let lifecycle = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TaskbarLifecycle;
+    if !lifecycle.is_null() {
+        let lifecycle = &*lifecycle;
+        match msg {
+            WM_QUERYENDSESSION => {
+                diagnose::log("taskbar observer: WM_QUERYENDSESSION; pausing recovery");
+                lifecycle.query_end_session();
+                return LRESULT(1);
+            }
+            WM_ENDSESSION => {
+                let ending = wparam.0 != 0;
+                diagnose::log(format!("taskbar observer: WM_ENDSESSION ending={ending}"));
+                lifecycle.end_session(ending);
+                if ending {
+                    PostQuitMessage(0);
+                }
+                return LRESULT(0);
+            }
+            WM_CLOSE => {
+                lifecycle.request_exit();
+                PostQuitMessage(0);
+                return LRESULT(0);
+            }
+            WM_NCDESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            _ if msg == WM_DISPLAYCHANGE
+                || msg == lifecycle.taskbar_created_message.load(Ordering::SeqCst) =>
+            {
+                diagnose::log(if msg == WM_DISPLAYCHANGE {
+                    "taskbar observer: WM_DISPLAYCHANGE received"
+                } else {
+                    "taskbar observer: TaskbarCreated received"
+                });
+                if !lifecycle.recovery_suppressed()
+                    && !lifecycle.widget_destroyed.load(Ordering::SeqCst)
+                {
+                    let widget = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.hwnd.to_hwnd())
+                    };
+                    if let Some(widget) = widget.filter(|widget| IsWindow(*widget).as_bool()) {
+                        let _ = PostMessageW(widget, WM_APP_TASKBAR_REFRESH, WPARAM(0), LPARAM(0));
+                    }
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn close_application(reason: &str) {
+    TASKBAR_LIFECYCLE.request_exit();
+    diagnose::log(format!("intentional exit requested reason={reason}"));
+    let observer = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.observer_hwnd.to_hwnd())
+    };
+    if let Some(observer) = observer {
+        // This window survives even when an update finishes after the widget is destroyed.
+        let posted = unsafe { PostMessageW(observer, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        diagnose::log(format!("observer WM_CLOSE posted={}", posted.is_ok()));
+    }
+}
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -215,14 +446,17 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
 
 /// Relaunch the widget as a fresh process after explorer.exe has restarted.
 ///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
+/// When the shell restarts it can destroy our embedded child window outright.
+/// The independent observer keeps the UI loop alive while the watchdog waits.
 /// Spawning a clean new process - which re-embeds into the freshly created
 /// taskbar - and exiting this one is the robust recovery. The child is flagged
 /// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
 /// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
+fn relaunch_self(reason: &str) {
+    if TASKBAR_LIFECYCLE.recovery_suppressed() {
+        return;
+    }
+    diagnose::log(format!("relaunch requested reason={reason}"));
     // Back off if we are relaunching very soon after the relaunch that spawned
     // us: that signals the shell is crash-looping, not a one-off restart.
     let now = now_unix_secs();
@@ -234,57 +468,143 @@ fn relaunch_self() {
         diagnose::log("relaunch storm detected; backing off before relaunching");
         std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
     }
+    // Recheck after backoff: shutdown or a successful live reattachment cancels recovery.
+    if taskbar_relaunch_reason().is_none() {
+        diagnose::log("relaunch canceled: recovery no longer needed or taskbar unavailable");
+        return;
+    }
+    save_state_settings();
 
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
+            diagnose::log(format!(
+                "watchdog: unable to resolve current executable kind={:?}",
+                error.kind()
+            ));
             return;
         }
     };
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    if TASKBAR_LIFECYCLE.recovery_suppressed() {
+        diagnose::log("relaunch canceled: application is shutting down");
+        return;
+    }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     match std::process::Command::new(exe)
         .args(&args)
         .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .env(ENV_LAST_RELAUNCH_UNIX, now_unix_secs().to_string())
         .spawn()
     {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+        Ok(child) => {
+            diagnose::log(format!(
+                "watchdog: child process spawned pid={}; exiting old process",
+                child.id()
+            ));
             std::process::exit(0);
         }
         Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
+            diagnose::log(format!(
+                "watchdog: unable to spawn relaunched instance kind={:?}",
+                error.kind()
+            ));
         }
     }
 }
 
 /// Detect explorer.exe restarts and recover from them.
 ///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
+/// A destroyed child no longer receives timers or broadcasts, so recovery must
+/// not depend on it. Wait for an available taskbar, then restore saved settings.
+fn taskbar_relaunch_reason() -> Option<&'static str> {
+    let (window_hwnd, stored) = {
+        let state = lock_state();
+        let s = state.as_ref()?;
+        if matches!(s.update_status, UpdateStatus::Applying) {
+            return None;
+        }
+        (s.hwnd.to_hwnd(), s.taskbar_hwnd)
+    };
+    let taskbars = native_interop::find_taskbars();
+    TASKBAR_LIFECYCLE.relaunch_reason(
+        unsafe { IsWindow(window_hwnd).as_bool() },
+        stored.is_some(),
+        stored.is_some_and(|old| taskbars.iter().any(|taskbar| taskbar.hwnd == old)),
+        !taskbars.is_empty(),
+    )
+}
 fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
-        };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
-        };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
-            relaunch_self();
+    diagnose::log("taskbar watchdog thread starting");
+    std::thread::spawn(move || {
+        let mut last_heartbeat = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+            if TASKBAR_LIFECYCLE.exit_requested.load(Ordering::SeqCst) {
+                return;
+            }
+            let (window_hwnd, stored, preferred, legacy_index, visible, dragging) = {
+                let state = lock_state();
+                let Some(s) = state.as_ref() else { continue };
+                // Let the update helper finish, then close via the surviving observer.
+                // A failed update clears Applying and allows recovery on the next tick.
+                if matches!(s.update_status, UpdateStatus::Applying) {
+                    continue;
+                }
+                (
+                    s.hwnd.to_hwnd(),
+                    s.taskbar_hwnd,
+                    s.monitor_device.clone(),
+                    s.taskbar_index,
+                    s.widget_visible,
+                    s.dragging,
+                )
+            };
+            let taskbars = native_interop::find_taskbars();
+            let window_valid = unsafe { IsWindow(window_hwnd).as_bool() };
+            if diagnose::is_enabled()
+                && last_heartbeat.elapsed() >= Duration::from_secs(TASKBAR_WATCH_HEARTBEAT_SECS)
+            {
+                let current: Vec<_> = taskbars.iter().map(|taskbar| taskbar.hwnd.0).collect();
+                let stored_taskbar_valid = stored.map(|hwnd| unsafe { IsWindow(hwnd).as_bool() });
+                diagnose::log(format!(
+                    "watchdog heartbeat hwnd={:?} hwnd_valid={window_valid} stored_taskbar={:?} stored_taskbar_valid={stored_taskbar_valid:?} current_taskbars={current:?}",
+                    window_hwnd.0,
+                    stored.map(|hwnd| hwnd.0)
+                ));
+                last_heartbeat = Instant::now();
+            }
+            if let Some(reason) = TASKBAR_LIFECYCLE.relaunch_reason(
+                window_valid,
+                stored.is_some(),
+                stored.is_some_and(|old| taskbars.iter().any(|taskbar| taskbar.hwnd == old)),
+                !taskbars.is_empty(),
+            ) {
+                diagnose::log(format!(
+                    "watchdog: recovery reason={reason} hwnd={:?} stored_taskbar={:?} -> relaunching",
+                    window_hwnd.0, stored.map(|hwnd| hwnd.0)
+                ));
+                relaunch_self(reason);
+            } else if window_valid
+                && !TASKBAR_LIFECYCLE.recovery_suppressed()
+                && !taskbars.is_empty()
+            {
+                // Secondary taskbars may appear after TaskbarCreated/display broadcasts.
+                let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
+                if !dragging
+                    && (stored != Some(taskbars[index].hwnd)
+                        || native_interop::taskbar_widget_needs_restore(
+                            window_hwnd,
+                            &taskbars[index],
+                            visible,
+                        ))
+                {
+                    unsafe {
+                        let _ =
+                            PostMessageW(window_hwnd, WM_APP_TASKBAR_REFRESH, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
         }
     });
 }
@@ -523,11 +843,7 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
     if migrated || claude_auto_disabled {
         save_settings(&settings);
         if migrated {
-            diagnose::log(format!(
-                "migrated settings from {} to {}",
-                legacy_path.display(),
-                current_path.display()
-            ));
+            diagnose::log("migrated settings from legacy location");
         }
         if claude_auto_disabled {
             diagnose::log(
@@ -907,6 +1223,10 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
 
     let index = requested_index.min(taskbars.len().saturating_sub(1));
     let taskbar = taskbars[index];
+    if taskbar.rect.right <= taskbar.rect.left || taskbar.rect.bottom <= taskbar.rect.top {
+        diagnose::log("taskbar attachment deferred: layout not ready");
+        return false;
+    }
     diagnose::log(format!(
         "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
         taskbars.len(),
@@ -926,6 +1246,15 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     }
 
     native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+    let actual_parent = unsafe { GetParent(hwnd) };
+    diagnose::log(format!(
+        "taskbar embedding parent expected={:?} actual={:?}",
+        taskbar.hwnd.0, actual_parent
+    ));
+    if actual_parent.ok() != Some(taskbar.hwnd) || !unsafe { IsWindow(hwnd).as_bool() } {
+        diagnose::log("taskbar embedding failed or widget was destroyed during attachment");
+        return false;
+    }
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -960,12 +1289,24 @@ fn preferred_taskbar_index(
     monitor_device: Option<&str>,
     legacy_index: usize,
 ) -> usize {
+    preferred_taskbar_index_with(
+        taskbars,
+        monitor_device,
+        legacy_index,
+        native_interop::taskbar_monitor_device,
+    )
+}
+
+fn preferred_taskbar_index_with(
+    taskbars: &[native_interop::TaskbarWindow],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+    device_for: impl Fn(&native_interop::TaskbarWindow) -> Option<String>,
+) -> usize {
     match monitor_device {
         Some(device) => taskbars
             .iter()
-            .position(|taskbar| {
-                native_interop::taskbar_monitor_device(taskbar).as_deref() == Some(device)
-            })
+            .position(|taskbar| device_for(taskbar).as_deref() == Some(device))
             .unwrap_or_else(|| {
                 taskbars
                     .iter()
@@ -976,20 +1317,20 @@ fn preferred_taskbar_index(
     }
 }
 
-fn refresh_taskbar_selection(hwnd: HWND) {
+fn refresh_taskbar_selection(hwnd: HWND) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
-        return;
+        return false;
     }
-    let (preferred, legacy_index, current) = {
+    let (preferred, legacy_index) = {
         let state = lock_state();
-        let Some(s) = state.as_ref() else { return };
-        (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        (s.monitor_device.clone(), s.taskbar_index)
     };
     let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
-    if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
-    }
+    attach_to_taskbar(hwnd, index)
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -1391,13 +1732,15 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
         app_state.language.strings()
     };
 
+    diagnose::log("self-update worker starting");
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
         match updater::begin_self_update(&release) {
-            Ok(()) => unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-            },
+            Ok(()) => {
+                close_application("self-update helper succeeded");
+            }
             Err(error) => {
+                diagnose::log("self-update helper failed");
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
@@ -1422,10 +1765,11 @@ fn begin_winget_update(hwnd: HWND) {
     .unwrap_or(LanguageId::English.strings());
 
     match updater::begin_winget_update() {
-        Ok(()) => unsafe {
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-        },
+        Ok(()) => {
+            close_application("winget update helper succeeded");
+        }
         Err(error) => {
+            diagnose::log("winget update helper failed");
             let message = format!("{}.\n\n{}", strings.update_failed, error);
             show_error_message(hwnd, strings.updates, &message);
         }
@@ -1872,12 +2216,14 @@ pub fn run() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CURRENT_DPI.store(GetDpiForSystem(), Ordering::Relaxed);
     }
-    diagnose::log("window::run started");
-
     // Single-instance guard: silently exit if another instance is running.
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
+    diagnose::log(format!(
+        "window::run started pid={} relaunch={is_relaunch}",
+        std::process::id()
+    ));
     let mutex_name = native_interop::wide_str("Global\\CodexUsage");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
@@ -1886,7 +2232,12 @@ pub fn run() {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
                     if is_relaunch {
                         diagnose::log("relaunch: waiting for previous instance to exit");
+                        let wait_started = Instant::now();
                         let wait_result = WaitForSingleObject(h, 10_000);
+                        diagnose::log(format!(
+                            "relaunch: previous-instance wait result={wait_result:?} elapsed_ms={}",
+                            wait_started.elapsed().as_millis()
+                        ));
                         if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
                             diagnose::log(format!(
                                 "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
@@ -1897,6 +2248,8 @@ pub fn run() {
                         diagnose::log("startup aborted: another instance is already running");
                         return;
                     }
+                } else {
+                    diagnose::log("single-instance mutex acquired");
                 }
                 h
             }
@@ -1916,6 +2269,17 @@ pub fn run() {
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
+        let observer_hwnd = match create_taskbar_observer(&TASKBAR_LIFECYCLE) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                diagnose::log_error("startup aborted: unable to create taskbar observer", error);
+                return;
+            }
+        };
+        diagnose::log(format!(
+            "taskbar observer created hwnd={:?}",
+            observer_hwnd.0
+        ));
         let (large_icon, small_icon) = load_embedded_app_icons();
 
         let wc = WNDCLASSEXW {
@@ -1991,11 +2355,13 @@ pub fn run() {
             let mut state = lock_state();
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
+                observer_hwnd: SendHwnd::from_hwnd(observer_hwnd),
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
                 win_event_hook: None,
                 is_dark,
                 embedded: false,
+                taskbar_restore_retries: 0,
                 language_override,
                 language,
                 appearance: settings.appearance,
@@ -2084,7 +2450,10 @@ pub fn run() {
         if settings.widget_visible {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
-        diagnose::log("window shown");
+        diagnose::log(format!(
+            "window initialization complete visible={} embedded={embedded}",
+            settings.widget_visible
+        ));
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
@@ -2097,8 +2466,19 @@ pub fn run() {
                 .map(|s| s.poll_interval_ms)
                 .unwrap_or(POLL_15_MIN)
         };
-        SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        let poll_timer = SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        diagnose::log(format!(
+            "poll timer installed={} interval_ms={initial_poll_ms}",
+            poll_timer != 0
+        ));
         SetTimer(hwnd, TIMER_FRESHNESS, 30_000, None);
+        if diagnose::is_enabled() {
+            let timer = SetTimer(hwnd, TIMER_DIAGNOSTIC_HEARTBEAT, 60_000, None);
+            diagnose::log(format!(
+                "diagnostic UI heartbeat timer installed={}",
+                timer != 0
+            ));
+        }
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -2128,10 +2508,25 @@ pub fn run() {
 
         // Message loop
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+        loop {
+            let result = GetMessageW(&mut msg, HWND::default(), 0, 0);
+            if result.0 == 0 {
+                diagnose::log(format!("WM_QUIT received exit_code={}", msg.wParam.0));
+                break;
+            }
+            if result.0 == -1 {
+                diagnose::log(format!("GetMessageW failed error={:?}", GetLastError()));
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        TASKBAR_LIFECYCLE.request_exit();
+        if !TASKBAR_LIFECYCLE.widget_destroyed.load(Ordering::SeqCst) && IsWindow(hwnd).as_bool() {
+            let _ = DestroyWindow(hwnd);
+        }
+        let _ = DestroyWindow(observer_hwnd);
+        diagnose::log("window message loop exited");
     }
 }
 
@@ -2212,7 +2607,7 @@ fn update_quota_tooltips() {
 }
 
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
-fn render_layered() {
+fn render_layered() -> bool {
     refresh_dpi();
     update_quota_tooltips();
     let (
@@ -2267,7 +2662,7 @@ fn render_layered() {
                 s.show_session_window,
                 s.show_weekly_window,
             ),
-            None => return,
+            None => return false,
         }
     };
 
@@ -2275,10 +2670,10 @@ fn render_layered() {
 
     // For non-embedded fallback, just invalidate and let WM_PAINT handle it
     if !embedded {
+        // SAFETY: HWND is the widget owned by this UI thread; no application locks are held.
         unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
+            return InvalidateRect(hwnd, None, false).as_bool();
         }
-        return;
     }
 
     let mut client_rect = RECT::default();
@@ -2288,7 +2683,7 @@ fn render_layered() {
     let width = client_rect.right - client_rect.left;
     let height = client_rect.bottom - client_rect.top;
     if width <= 0 || height <= 0 {
-        return;
+        return false;
     }
 
     let accent = claude_accent_color();
@@ -2318,9 +2713,10 @@ fn render_layered() {
             CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
 
         if dib.is_invalid() || bits.is_null() {
+            diagnose::log("layered rendering failed: unable to allocate bitmap");
             let _ = DeleteDC(mem_dc);
             ReleaseDC(hwnd, screen_dc);
-            return;
+            return false;
         }
 
         let old_bmp = SelectObject(mem_dc, dib);
@@ -2393,7 +2789,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        let rendered = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -2404,12 +2800,16 @@ fn render_layered() {
             Some(&blend),
             ULW_ALPHA,
         );
+        if let Err(error) = &rendered {
+            diagnose::log_error("UpdateLayeredWindow failed", error);
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
         ReleaseDC(hwnd, screen_dc);
+        rendered.is_ok()
     }
 }
 
@@ -2792,6 +3192,7 @@ fn complete_provider_poll(
     };
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
+        diagnose::log("low quota alert emitted");
     }
     if !alerts.is_empty() {
         save_state_settings();
@@ -2906,7 +3307,7 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
-fn position_at_taskbar() {
+fn position_at_taskbar() -> bool {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
@@ -2914,19 +3315,19 @@ fn position_at_taskbar() {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
-            None => return,
+            None => return false,
         };
 
         // Don't fight the user's drag
         if s.dragging {
-            return;
+            return false;
         }
 
         let taskbar_hwnd = match s.taskbar_hwnd {
             Some(h) => h,
             None => {
                 diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
+                return false;
             }
         };
 
@@ -2943,11 +3344,15 @@ fn position_at_taskbar() {
         Some(r) => r,
         None => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
+            return false;
         }
     };
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+    if taskbar_rect.right <= taskbar_rect.left || taskbar_height <= 0 {
+        diagnose::log("position_at_taskbar skipped: taskbar layout not ready");
+        return false;
+    }
     let mut tray_left = taskbar_rect.right;
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
@@ -3008,6 +3413,7 @@ fn position_at_taskbar() {
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
     }
+    true
 }
 
 fn compute_anchor_x(
@@ -3105,6 +3511,50 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_CLOSE => diagnose::log(format!("WM_CLOSE received hwnd={:?}", hwnd.0)),
+        WM_QUERYENDSESSION => diagnose::log("WM_QUERYENDSESSION received"),
+        WM_ENDSESSION => diagnose::log(format!("WM_ENDSESSION received ending={}", wparam.0 != 0)),
+        WM_POWERBROADCAST => {
+            diagnose::log(format!("WM_POWERBROADCAST received event={}", wparam.0))
+        }
+        _ => {}
+    }
+
+    match msg {
+        WM_CLOSE => {
+            TASKBAR_LIFECYCLE.request_exit();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_QUERYENDSESSION => {
+            TASKBAR_LIFECYCLE.query_end_session();
+            LRESULT(1)
+        }
+        WM_ENDSESSION => {
+            TASKBAR_LIFECYCLE.end_session(wparam.0 != 0);
+            if wparam.0 != 0 {
+                PostQuitMessage(0);
+            }
+            LRESULT(0)
+        }
+        WM_APP_TASKBAR_REFRESH => {
+            if !TASKBAR_LIFECYCLE.recovery_suppressed()
+                && !TASKBAR_LIFECYCLE.widget_destroyed.load(Ordering::SeqCst)
+            {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.taskbar_restore_retries = 3;
+                    }
+                }
+                restore_widget(hwnd);
+                // Display/Explorer layout may settle after the first notification.
+                SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+                // Explorer discards the previous tray-icon registration.
+                tray_icon::remove_all(hwnd);
+                sync_tray_icons(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
@@ -3129,7 +3579,17 @@ unsafe extern "system" fn wnd_proc(
             if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
                 || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
         {
+            request_widget_restore(hwnd);
             recover_polling(hwnd, false);
+            LRESULT(1)
+        }
+        WM_POWERBROADCAST if wparam.0 == PBT_POWERSETTINGCHANGE as usize => {
+            // SAFETY: Windows owns this notification until this WndProc returns.
+            // Only a scalar restoration message is queued, never lparam itself.
+            if recovery_events::display_turned_on(lparam) {
+                diagnose::log("session display turned on: restoring widget");
+                request_widget_restore(hwnd);
+            }
             LRESULT(1)
         }
         _ if msg == recovery_events::MESSAGE => {
@@ -3145,12 +3605,7 @@ unsafe extern "system" fn wnd_proc(
                 check_theme_change();
                 check_language_change();
             }
-            refresh_dpi();
-            if msg == WM_DISPLAYCHANGE {
-                refresh_taskbar_selection(hwnd);
-            }
-            position_at_taskbar();
-            render_layered();
+            request_widget_restore(hwnd);
             LRESULT(0)
         }
         WM_TIMER => {
@@ -3165,21 +3620,17 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_TASKBAR_RETRY => {
-                    let attachment = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
+                    let restored = restore_widget(hwnd);
+                    let retry = {
+                        let mut state = lock_state();
+                        state.as_mut().is_some_and(|s| {
+                            taskbar_restore_retry_needed(&mut s.taskbar_restore_retries, s.embedded)
+                        })
                     };
-                    match attachment {
-                        Some((true, _)) | None => {
-                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                        }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
-                                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                                position_at_taskbar();
-                                render_layered();
-                                diagnose::log("taskbar attached after startup retry");
-                            }
+                    if !retry || TASKBAR_LIFECYCLE.recovery_suppressed() {
+                        let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                        if !restored {
+                            diagnose::log("widget restoration retries stopped before success");
                         }
                     }
                 }
@@ -3189,6 +3640,9 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
+                }
+                TIMER_DIAGNOSTIC_HEARTBEAT => {
+                    diagnose::log(format!("UI heartbeat hwnd={:?}", hwnd.0));
                 }
                 _ => {}
             }
@@ -3446,14 +3900,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 2 => {
-                    let hook = {
-                        let state = lock_state();
-                        state.as_ref().and_then(|s| s.win_event_hook)
-                    };
-                    if let Some(h) = hook {
-                        native_interop::unhook_win_event(h);
-                    }
-                    PostQuitMessage(0);
+                    close_application("exit menu command selected");
                 }
                 IDM_RESET_POSITION => {
                     {
@@ -3464,7 +3911,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     save_state_settings();
-                    position_at_taskbar();
+                    request_widget_restore(hwnd);
                 }
                 IDM_ANCHOR_LEFT => {
                     {
@@ -3734,21 +4181,39 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let watch = {
+            let (watch, hook, taskbar_hwnd, initialized) = {
                 let mut state = lock_state();
-                state.as_mut().and_then(|s| s.recovery_watch.take())
+                match state.as_mut() {
+                    Some(s) => {
+                        s.tray_notify_hwnd = None;
+                        s.dragging = false;
+                        (
+                            s.recovery_watch.take(),
+                            s.win_event_hook.take(),
+                            s.taskbar_hwnd,
+                            true,
+                        )
+                    }
+                    None => (None, None, None, false),
+                }
             };
+            let quit = TASKBAR_LIFECYCLE.record_widget_destroyed(initialized);
             drop(watch);
             quota_tooltip::clear();
-            let hook = {
-                let state = lock_state();
-                state.as_ref().and_then(|s| s.win_event_hook)
-            };
+            let taskbar_valid = taskbar_hwnd.map(|taskbar| IsWindow(taskbar).as_bool());
+            diagnose::log(format!(
+                "WM_DESTROY received hwnd={:?} stored_taskbar={:?} taskbar_valid={taskbar_valid:?} intentional_exit={quit}; {}",
+                hwnd.0,
+                taskbar_hwnd.map(|taskbar| taskbar.0),
+                if quit { "posting WM_QUIT" } else { "waiting for taskbar recovery" }
+            ));
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            if quit {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -4731,8 +5196,24 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 }
 
 #[cfg(test)]
+#[path = "window/taskbar_recovery_tests.rs"]
+mod taskbar_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_heartbeat_does_not_replace_existing_timers() {
+        assert!(![
+            TIMER_POLL,
+            TIMER_COUNTDOWN,
+            TIMER_UPDATE_CHECK,
+            TIMER_FRESHNESS,
+            TIMER_TASKBAR_RETRY,
+        ]
+        .contains(&TIMER_DIAGNOSTIC_HEARTBEAT));
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {
