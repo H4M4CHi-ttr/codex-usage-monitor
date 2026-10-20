@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -37,7 +37,7 @@ jobs:
           git rev-parse HEAD | Set-Content -Encoding ascii dist/source-revision.txt
 
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codex-usage-windows-x64-${{ github.run_id }}
           path: dist/
