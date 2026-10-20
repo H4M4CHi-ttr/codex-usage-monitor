@@ -1,0 +1,45 @@
+name: Build executable
+run-name: Build executable from ${{ inputs.ref || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit SHA to build (blank uses the selected workflow branch)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare build artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/codex-usage.exe dist/codex-usage.exe
+          $hash = (Get-FileHash -Algorithm SHA256 dist/codex-usage.exe).Hash.ToLowerInvariant()
+          "$hash  codex-usage.exe" | Set-Content -Encoding ascii dist/codex-usage.exe.sha256
+          git rev-parse HEAD | Set-Content -Encoding ascii dist/source-revision.txt
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-usage-windows-x64-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
